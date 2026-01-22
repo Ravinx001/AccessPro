@@ -1,35 +1,52 @@
-//============================================================================
-// RFID Reader ESP32 - Main Controller
-// Handles: RFID scanning, LED control, Buzzer, Serial communication
-// Target: 3000+ reads/hour with optimal response times
-//============================================================================
-
+#include <WiFi.h>
+#include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>
 
-// ========== HARDWARE CONFIGURATION ==========
-// RFID Wiegand pins
+// ========== PRODUCTION CONFIGURATION ==========
+// WiFi Configuration - Change these for your network
+const char* WIFI_SSID = "Ravindu's_A14";
+const char* WIFI_PASSWORD = "12345678";
+
+// API Configuration
+const String API_BASE_URL = "https://rgcbmt33-5000.asse.devtunnels.ms/api/scan/in";
+const String DEVICE_ID = "front_in_scanner_1";
+const String GATE_LOCATION = "IN";
+
+// Performance Settings
+#define MAX_RETRIES 3
+#define HTTP_TIMEOUT 8000
+#define WIFI_TIMEOUT 10000
+#define CARD_QUEUE_SIZE 15
+#define WIEGAND_WAIT_TIME 50
+#define WDT_TIMEOUT 30
+
+// ========== PIN DEFINITIONS ==========
+// Wiegand Interface
 #define D0_PIN 2
 #define D1_PIN 4
 
-// LED Control pins (connected to 4-channel relay)
-#define GREEN_LED_PIN 16   // Relay CH1
-#define YELLOW_LED_PIN 17  // Relay CH2
-#define RED_LED_PIN 18     // Relay CH3
-#define STATUS_LED_PIN 19  // Relay CH4 (system status)
+// 4-Channel Relay Module (Active LOW)
+#define GREEN_LED_PIN 12   // Relay Channel 1
+#define YELLOW_LED_PIN 14  // Relay Channel 2
+#define RED_LED_PIN 27     // Relay Channel 3
+#define BUZZER_PIN 26      // Relay Channel 4
 
-// Buzzer pin
-#define BUZZER_PIN 21
+// Status LED (Built-in)
+#define STATUS_LED_PIN 2
 
-// Serial communication pins (to Network ESP32)
-#define RX_PIN 16  // GPIO16 (Serial2 RX)
-#define TX_PIN 17  // GPIO17 (Serial2 TX)
+// ========== CARD QUEUE SYSTEM ==========
+struct CardRead {
+  String cardId;
+  unsigned long timestamp;
+  bool processed;
+  int retryCount;
+};
 
-// ========== PERFORMANCE CONFIGURATION ==========
-#define WIEGAND_TIMEOUT 100      // ms - timeout between bits
-#define CARD_PROCESS_DELAY 200   // ms - delay after card processing
-#define LED_DISPLAY_TIME 3000    // ms - how long LEDs stay on
-#define QUEUE_SIZE 20            // Increased queue for burst handling
-#define MAX_RESPONSE_WAIT 10000  // ms - max wait for API response
+CardRead cardQueue[CARD_QUEUE_SIZE];
+int queueHead = 0;
+int queueTail = 0;
+int queueCount = 0;
 
 // ========== WIEGAND VARIABLES ==========
 volatile unsigned long cardData = 0;
@@ -37,43 +54,230 @@ volatile int bitCount = 0;
 volatile unsigned long lastBitTime = 0;
 volatile bool cardReady = false;
 
-// ========== CARD QUEUE SYSTEM ==========
-struct CardRead {
-  String cardId;
-  unsigned long timestamp;
-  bool processed;
-  bool responseReceived;
-};
-
-CardRead cardQueue[QUEUE_SIZE];
-int queueHead = 0;
-int queueTail = 0;
-int queueCount = 0;
-
-// ========== STATUS TRACKING ==========
+// ========== PERFORMANCE MONITORING ==========
 unsigned long totalReads = 0;
-unsigned long successfulReads = 0;
-unsigned long failedReads = 0;
-unsigned long sessionStart = 0;
+unsigned long successfulRequests = 0;
+unsigned long failedRequests = 0;
+unsigned long wifiReconnects = 0;
 unsigned long lastStatsReport = 0;
+unsigned long sessionStart = 0;
+unsigned long lastHeartbeat = 0;
 
-// Current LED state
-String currentLedState = "OFF";
-unsigned long ledStateTime = 0;
-bool systemReady = false;
-
-// ========== BUZZER PATTERNS ==========
-struct BuzzerPattern {
-  int beeps;
-  int beepDuration;
-  int pauseDuration;
+// ========== SYSTEM STATE ==========
+enum SystemState {
+  SYSTEM_BOOTING,
+  SYSTEM_READY,
+  SYSTEM_ERROR,
+  SYSTEM_MAINTENANCE
 };
 
-BuzzerPattern greenPattern = { 1, 100, 0 };     // Single short beep
-BuzzerPattern redPattern = { 3, 200, 100 };     // Three medium beeps
-BuzzerPattern yellowPattern = { 2, 150, 150 };  // Two medium beeps
+SystemState currentState = SYSTEM_BOOTING;
+bool wifiConnected = false;
 
-// ========== INTERRUPT HANDLERS ==========
+// Forward declarations
+void IRAM_ATTR D0_ISR();
+void IRAM_ATTR D1_ISR();
+void controlLED(String result, bool success);
+void controlBuzzer(String pattern);
+void connectToWiFi();
+void maintainWiFi();
+
+// ========== SETUP FUNCTION ==========
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\n=== ESP32 RFID Access Control v3.0 ===");
+  Serial.println("Target: 3000+ reads/hour production system");
+
+  // Configure watchdog timer
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT * 1000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  esp_task_wdt_init(&wdt_config);
+  esp_task_wdt_add(NULL);
+
+  // Initialize pins
+  initializePins();
+
+  // Show startup sequence
+  startupSequence();
+
+  // Initialize Wiegand interrupts
+  attachInterrupt(digitalPinToInterrupt(D0_PIN), D0_ISR, FALLING);
+  attachInterrupt(digitalPinToInterrupt(D1_PIN), D1_ISR, FALLING);
+
+  // Initialize variables
+  resetWiegandData();
+  initializeQueue();
+
+  // Connect to WiFi
+  connectToWiFi();
+
+  // Performance monitoring
+  sessionStart = millis();
+  lastStatsReport = millis();
+  lastHeartbeat = millis();
+
+  currentState = SYSTEM_READY;
+  Serial.println("✓ System ready for production");
+  Serial.println("✓ Monitoring started");
+
+  // Ready indication
+  controlLED("GREEN", true);
+  controlBuzzer("READY");
+  delay(1000);
+  turnOffAllLEDs();
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  // Feed watchdog
+  esp_task_wdt_reset();
+
+  // High priority: Process card reads
+  checkWiegandData();
+
+  // Process API request queue
+  processQueue();
+
+  // Maintain WiFi connection
+  maintainWiFi();
+
+  // System monitoring
+  systemMonitoring();
+
+  // Minimal delay for optimal performance
+  delay(10);
+}
+
+// ========== PIN INITIALIZATION ==========
+void initializePins() {
+  // Wiegand pins
+  pinMode(D0_PIN, INPUT_PULLUP);
+  pinMode(D1_PIN, INPUT_PULLUP);
+
+  // Relay module pins (Active LOW)
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(YELLOW_LED_PIN, OUTPUT);
+  pinMode(RED_LED_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // Status LED
+  pinMode(STATUS_LED_PIN, OUTPUT);
+
+  // Turn off all outputs initially
+  turnOffAllLEDs();
+  digitalWrite(BUZZER_PIN, HIGH);  // Relay OFF
+  digitalWrite(STATUS_LED_PIN, LOW);
+
+  Serial.println("✓ GPIO pins initialized");
+}
+
+void turnOffAllLEDs() {
+  digitalWrite(GREEN_LED_PIN, HIGH);   // Relay OFF
+  digitalWrite(YELLOW_LED_PIN, HIGH);  // Relay OFF
+  digitalWrite(RED_LED_PIN, HIGH);     // Relay OFF
+}
+
+// ========== STARTUP SEQUENCE ==========
+void startupSequence() {
+  Serial.println("Running startup diagnostics...");
+
+  // Test all LEDs
+  Serial.println("Testing LEDs...");
+  digitalWrite(RED_LED_PIN, LOW);
+  delay(300);
+  digitalWrite(RED_LED_PIN, HIGH);
+  digitalWrite(YELLOW_LED_PIN, LOW);
+  delay(300);
+  digitalWrite(YELLOW_LED_PIN, HIGH);
+  digitalWrite(GREEN_LED_PIN, LOW);
+  delay(300);
+  digitalWrite(GREEN_LED_PIN, HIGH);
+
+  // Test buzzer
+  Serial.println("Testing buzzer...");
+  digitalWrite(BUZZER_PIN, LOW);
+  delay(200);
+  digitalWrite(BUZZER_PIN, HIGH);
+
+  Serial.println("✓ Hardware diagnostics completed");
+}
+
+// ========== WIFI CONNECTION ==========
+void connectToWiFi() {
+  Serial.println("Connecting to WiFi: " + String(WIFI_SSID));
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long startTime = millis();
+  int dots = 0;
+
+  while (WiFi.status() != WL_CONNECTED && (millis() - startTime) < WIFI_TIMEOUT) {
+    delay(500);
+    Serial.print(".");
+    dots++;
+    if (dots % 10 == 0) Serial.println();
+
+    // Yellow LED blink during connection
+    digitalWrite(YELLOW_LED_PIN, LOW);
+    delay(100);
+    digitalWrite(YELLOW_LED_PIN, HIGH);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n✓ WiFi connected successfully");
+    Serial.println("✓ IP Address: " + WiFi.localIP().toString());
+    Serial.println("✓ Signal Strength: " + String(WiFi.RSSI()) + " dBm");
+    digitalWrite(STATUS_LED_PIN, HIGH);
+  } else {
+    wifiConnected = false;
+    Serial.println("\n✗ WiFi connection failed!");
+    currentState = SYSTEM_ERROR;
+    controlLED("RED", false);
+    controlBuzzer("ERROR");
+  }
+}
+
+void maintainWiFi() {
+  static unsigned long lastCheck = 0;
+
+  if (millis() - lastCheck > 5000) {  // Check every 5 seconds
+    lastCheck = millis();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiConnected) {
+        Serial.println("! WiFi connection lost - reconnecting...");
+        wifiConnected = false;
+        wifiReconnects++;
+        digitalWrite(STATUS_LED_PIN, LOW);
+        controlLED("YELLOW", false);
+      }
+
+      WiFi.reconnect();
+      delay(1000);
+
+      if (WiFi.status() == WL_CONNECTED) {
+        wifiConnected = true;
+        Serial.println("✓ WiFi reconnected");
+        digitalWrite(STATUS_LED_PIN, HIGH);
+        turnOffAllLEDs();
+      }
+    } else if (!wifiConnected) {
+      wifiConnected = true;
+      Serial.println("✓ WiFi connection restored");
+      digitalWrite(STATUS_LED_PIN, HIGH);
+      turnOffAllLEDs();
+    }
+  }
+}
+
+// ========== WIEGAND PROCESSING ==========
 void IRAM_ATTR D0_ISR() {
   if (bitCount < 32) {
     cardData <<= 1;
@@ -91,122 +295,8 @@ void IRAM_ATTR D1_ISR() {
   }
 }
 
-// ========== SETUP FUNCTION ==========
-void setup() {
-  Serial.begin(115200);
-  Serial2.begin(115200, SERIAL_8N1, RX_PIN, TX_PIN);
-
-  Serial.println("=== RFID Reader ESP32 v2.0 ===");
-  Serial.println("Production Concert Entry System");
-
-  // Initialize hardware pins
-  initializePins();
-
-  // Initialize interrupts
-  attachInterrupt(digitalPinToInterrupt(D0_PIN), D0_ISR, FALLING);
-  attachInterrupt(digitalPinToInterrupt(D1_PIN), D1_ISR, FALLING);
-
-  // Initialize system
-  resetWiegandData();
-  initializeQueue();
-
-  // Startup sequence
-  performStartupSequence();
-
-  sessionStart = millis();
-  lastStatsReport = millis();
-
-  Serial.println("System ready - Waiting for network controller...");
-  waitForNetworkController();
-}
-
-void initializePins() {
-  // RFID pins
-  pinMode(D0_PIN, INPUT_PULLUP);
-  pinMode(D1_PIN, INPUT_PULLUP);
-
-  // LED control pins (relay control)
-  pinMode(GREEN_LED_PIN, OUTPUT);
-  pinMode(YELLOW_LED_PIN, OUTPUT);
-  pinMode(RED_LED_PIN, OUTPUT);
-  pinMode(STATUS_LED_PIN, OUTPUT);
-
-  // Buzzer pin
-  pinMode(BUZZER_PIN, OUTPUT);
-
-  // Initialize all LEDs OFF
-  setAllLedsOff();
-}
-
-void performStartupSequence() {
-  Serial.println("Performing startup sequence...");
-
-  // Test LEDs in sequence
-  setLedState("GREEN");
-  delay(500);
-  setLedState("YELLOW");
-  delay(500);
-  setLedState("RED");
-  delay(500);
-  setAllLedsOff();
-
-  // Test buzzer patterns
-  playBuzzerPattern(greenPattern);
-  delay(300);
-  playBuzzerPattern(yellowPattern);
-  delay(300);
-  playBuzzerPattern(redPattern);
-  delay(300);
-
-  Serial.println("Hardware test completed");
-}
-
-void waitForNetworkController() {
-  Serial.println("Waiting for network controller ready signal...");
-
-  unsigned long timeout = millis() + 30000;  // 30 second timeout
-  while (millis() < timeout) {
-    if (Serial2.available()) {
-      String message = Serial2.readStringUntil('\n');
-      if (message.indexOf("NETWORK_READY") >= 0) {
-        systemReady = true;
-        digitalWrite(STATUS_LED_PIN, HIGH);
-        Serial.println("Network controller ready - System operational");
-        playBuzzerPattern(greenPattern);
-        return;
-      }
-    }
-    delay(100);
-  }
-
-  Serial.println("WARNING: Network controller not responding - Running in offline mode");
-  digitalWrite(STATUS_LED_PIN, LOW);
-}
-
-// ========== MAIN LOOP ==========
-void loop() {
-  // High priority: Check for card reads
-  checkWiegandData();
-
-  // Process queued requests
-  processQueue();
-
-  // Handle responses from network controller
-  handleNetworkResponse();
-
-  // Manage LED states
-  manageLedStates();
-
-  // Performance monitoring
-  reportStats();
-
-  // Minimal delay for optimal performance
-  delayMicroseconds(100);
-}
-
-// ========== WIEGAND PROCESSING ==========
 void checkWiegandData() {
-  if (bitCount >= 26 && (millis() - lastBitTime) > WIEGAND_TIMEOUT && !cardReady) {
+  if (bitCount >= 26 && (millis() - lastBitTime) > WIEGAND_WAIT_TIME && !cardReady) {
     cardReady = true;
     processCardRead();
     resetWiegandData();
@@ -215,27 +305,26 @@ void checkWiegandData() {
 
 void processCardRead() {
   if (bitCount == 26) {
+    // Extract facility code and card number
     unsigned long facilityCode = (cardData >> 17) & 0xFF;
     unsigned long cardNumber = (cardData >> 1) & 0xFFFF;
     String cardId = String(facilityCode) + "-" + String(cardNumber);
 
-    Serial.println("[CARD_READ] " + cardId);
+    Serial.println("\n--- Card Read: " + cardId + " ---");
     totalReads++;
 
-    if (systemReady) {
-      if (addToQueue(cardId)) {
-        setLedState("YELLOW");            // Processing indicator
-        playBuzzerPattern({ 1, 50, 0 });  // Quick beep for read confirmation
-      } else {
-        Serial.println("[ERROR] Queue full - dropping card read");
-        setLedState("RED");
-        playBuzzerPattern(redPattern);
-        failedReads++;
-      }
+    // Add to processing queue
+    if (addToQueue(cardId)) {
+      // Brief yellow LED flash for card read
+      digitalWrite(YELLOW_LED_PIN, LOW);
+      delay(50);
+      digitalWrite(YELLOW_LED_PIN, HIGH);
     } else {
-      Serial.println("[WARNING] System not ready - card read ignored");
-      setLedState("YELLOW");
-      playBuzzerPattern(yellowPattern);
+      Serial.println("✗ Queue full! Card dropped.");
+      controlLED("YELLOW", false);
+      controlBuzzer("ERROR");
+      delay(100);
+      turnOffAllLEDs();
     }
   }
   cardReady = false;
@@ -249,180 +338,216 @@ void resetWiegandData() {
 
 // ========== QUEUE MANAGEMENT ==========
 void initializeQueue() {
-  for (int i = 0; i < QUEUE_SIZE; i++) {
+  for (int i = 0; i < CARD_QUEUE_SIZE; i++) {
     cardQueue[i].processed = true;
-    cardQueue[i].responseReceived = true;
+    cardQueue[i].retryCount = 0;
   }
   queueHead = queueTail = queueCount = 0;
 }
 
 bool addToQueue(String cardId) {
-  if (queueCount >= QUEUE_SIZE) {
+  if (queueCount >= CARD_QUEUE_SIZE) {
     return false;
   }
 
   cardQueue[queueTail].cardId = cardId;
   cardQueue[queueTail].timestamp = millis();
   cardQueue[queueTail].processed = false;
-  cardQueue[queueTail].responseReceived = false;
+  cardQueue[queueTail].retryCount = 0;
 
-  queueTail = (queueTail + 1) % QUEUE_SIZE;
+  queueTail = (queueTail + 1) % CARD_QUEUE_SIZE;
   queueCount++;
   return true;
 }
 
 void processQueue() {
-  if (queueCount == 0) return;
+  if (queueCount == 0 || !wifiConnected) return;
 
-  // Send next unprocessed request
+  // Process one item per loop iteration
   if (!cardQueue[queueHead].processed) {
-    sendToNetworkController(cardQueue[queueHead].cardId);
-    cardQueue[queueHead].processed = true;
-    cardQueue[queueHead].timestamp = millis();  // Update for timeout tracking
-  }
-
-  // Check for timeouts
-  if ((millis() - cardQueue[queueHead].timestamp) > MAX_RESPONSE_WAIT) {
-    Serial.println("[TIMEOUT] No response for: " + cardQueue[queueHead].cardId);
-    setLedState("YELLOW");
-    playBuzzerPattern(yellowPattern);
-
-    // Remove from queue
-    cardQueue[queueHead].responseReceived = true;
-    queueHead = (queueHead + 1) % QUEUE_SIZE;
-    queueCount--;
-    failedReads++;
+    sendAPIRequest(cardQueue[queueHead].cardId, queueHead);
   }
 }
 
-// ========== NETWORK COMMUNICATION ==========
-void sendToNetworkController(String cardId) {
-  StaticJsonDocument<200> request;
-  request["action"] = "scan";
-  request["cardId"] = cardId;
-  request["timestamp"] = millis();
+// ========== HTTP API REQUEST ==========
+void sendAPIRequest(String cardId, int queueIndex) {
+  Serial.println("Sending API request...");
+
+  HTTPClient http;
+  http.setTimeout(HTTP_TIMEOUT);
+  http.begin(API_BASE_URL);
+  http.addHeader("Content-Type", "application/json");
+
+  // Create JSON payload
+  StaticJsonDocument<256> payload;
+  payload["rfidTag"] = cardId;
+  payload["gateLocation"] = GATE_LOCATION;
+  payload["deviceId"] = DEVICE_ID;
 
   String jsonString;
-  serializeJson(request, jsonString);
+  serializeJson(payload, jsonString);
 
-  Serial2.println(jsonString);
-  Serial.println("[SENT] " + jsonString);
-}
+  Serial.println("Request: " + jsonString);
 
-void handleNetworkResponse() {
-  if (Serial2.available()) {
-    String response = Serial2.readStringUntil('\n');
-    Serial.println("[RECEIVED] " + response);
+  // Send POST request
+  int httpResponseCode = http.POST(jsonString);
 
-    // Parse response
-    StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, response);
+  if (httpResponseCode > 0) {
+    String response = http.getString();
+    Serial.println("Response: " + response);
 
-    if (!error) {
-      String cardId = doc["cardId"] | "";
-      bool success = doc["success"] | false;
-      String result = doc["result"] | "UNKNOWN";
-      String message = doc["message"] | "";
-
-      // Find matching queue item
-      for (int i = 0; i < QUEUE_SIZE; i++) {
-        int index = (queueHead + i) % QUEUE_SIZE;
-        if (!cardQueue[index].responseReceived && cardQueue[index].cardId == cardId) {
-          cardQueue[index].responseReceived = true;
-
-          // Update statistics
-          if (success) {
-            successfulReads++;
-          } else {
-            failedReads++;
-          }
-
-          // Control LEDs and buzzer based on result
-          if (result == "GREEN") {
-            setLedState("GREEN");
-            playBuzzerPattern(greenPattern);
-          } else if (result == "RED") {
-            setLedState("RED");
-            playBuzzerPattern(redPattern);
-          } else {
-            setLedState("YELLOW");
-            playBuzzerPattern(yellowPattern);
-          }
-
-          Serial.println("[PROCESSED] " + cardId + " - " + result + " - " + message);
-
-          // Remove from queue if at head
-          if (index == queueHead) {
-            queueHead = (queueHead + 1) % QUEUE_SIZE;
-            queueCount--;
-          }
-          break;
-        }
-      }
+    if (httpResponseCode == 200) {
+      parseAndProcessResponse(response, cardId);
+      successfulRequests++;
+      markQueueItemProcessed(queueIndex);
     } else {
-      Serial.println("[ERROR] Invalid JSON response");
+      Serial.println("✗ HTTP Error: " + String(httpResponseCode));
+      handleRequestFailure(queueIndex);
     }
+  } else {
+    Serial.println("✗ Request failed: " + http.errorToString(httpResponseCode));
+    handleRequestFailure(queueIndex);
+  }
+
+  http.end();
+}
+
+void parseAndProcessResponse(String jsonResponse, String cardId) {
+  StaticJsonDocument<512> doc;
+  DeserializationError error = deserializeJson(doc, jsonResponse);
+
+  if (error) {
+    Serial.println("✗ JSON Parse Error");
+    controlLED("YELLOW", false);
+    controlBuzzer("ERROR");
+    failedRequests++;
+    return;
+  }
+
+  bool success = doc["success"] | false;
+  String result = doc["result"] | "UNKNOWN";
+  String message = doc["message"] | "No message";
+
+  // Display parsed response
+  Serial.println("Success: " + String(success ? "true" : "false"));
+  Serial.println("Result: " + result);
+  Serial.println("Message: " + message);
+  Serial.println("---");
+
+  // Control LEDs and buzzer based on response
+  controlLED(result, success);
+
+  if (success && result == "GREEN") {
+    controlBuzzer("SUCCESS");
+  } else if (!success || result == "RED") {
+    controlBuzzer("DENIED");
+  } else {
+    controlBuzzer("WARNING");
+  }
+
+  // Auto turn off after 3 seconds
+  delay(3000);
+  turnOffAllLEDs();
+}
+
+void handleRequestFailure(int queueIndex) {
+  cardQueue[queueIndex].retryCount++;
+
+  if (cardQueue[queueIndex].retryCount >= MAX_RETRIES) {
+    Serial.println("✗ Max retries reached - dropping request");
+    markQueueItemProcessed(queueIndex);
+    failedRequests++;
+
+    controlLED("YELLOW", false);
+    controlBuzzer("ERROR");
+    delay(2000);
+    turnOffAllLEDs();
+  } else {
+    Serial.println("! Retrying... (" + String(cardQueue[queueIndex].retryCount) + "/" + String(MAX_RETRIES) + ")");
+    delay(1000);  // Wait before retry
   }
 }
 
-// ========== LED CONTROL ==========
-void setLedState(String state) {
-  setAllLedsOff();
-  currentLedState = state;
-  ledStateTime = millis();
+void markQueueItemProcessed(int queueIndex) {
+  cardQueue[queueIndex].processed = true;
+  queueHead = (queueHead + 1) % CARD_QUEUE_SIZE;
+  queueCount--;
+}
 
-  if (state == "GREEN") {
-    digitalWrite(GREEN_LED_PIN, HIGH);
-  } else if (state == "RED") {
-    digitalWrite(RED_LED_PIN, HIGH);
-  } else if (state == "YELLOW") {
-    digitalWrite(YELLOW_LED_PIN, HIGH);
+// ========== LED AND BUZZER CONTROL ==========
+void controlLED(String result, bool success) {
+  turnOffAllLEDs();  // Turn off all first
+
+  if (result == "GREEN" && success) {
+    digitalWrite(GREEN_LED_PIN, LOW);  // Turn ON green LED
+  } else if (result == "RED" || !success) {
+    digitalWrite(RED_LED_PIN, LOW);  // Turn ON red LED
+  } else {
+    digitalWrite(YELLOW_LED_PIN, LOW);  // Turn ON yellow LED
   }
 }
 
-void setAllLedsOff() {
-  digitalWrite(GREEN_LED_PIN, LOW);
-  digitalWrite(YELLOW_LED_PIN, LOW);
-  digitalWrite(RED_LED_PIN, LOW);
-}
-
-void manageLedStates() {
-  if (currentLedState != "OFF" && (millis() - ledStateTime) > LED_DISPLAY_TIME) {
-    setAllLedsOff();
-    currentLedState = "OFF";
-  }
-}
-
-// ========== BUZZER CONTROL ==========
-void playBuzzerPattern(BuzzerPattern pattern) {
-  for (int i = 0; i < pattern.beeps; i++) {
-    digitalWrite(BUZZER_PIN, HIGH);
-    delay(pattern.beepDuration);
+void controlBuzzer(String pattern) {
+  if (pattern == "SUCCESS") {
+    // Single short beep
     digitalWrite(BUZZER_PIN, LOW);
-    if (i < pattern.beeps - 1) {
-      delay(pattern.pauseDuration);
+    delay(150);
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else if (pattern == "DENIED") {
+    // Two short beeps
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(100);
+    digitalWrite(BUZZER_PIN, HIGH);
+  } else if (pattern == "WARNING" || pattern == "ERROR") {
+    // Three short beeps
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(80);
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(80);
     }
+  } else if (pattern == "READY") {
+    // Long single beep
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(300);
+    digitalWrite(BUZZER_PIN, HIGH);
   }
 }
 
-// ========== PERFORMANCE MONITORING ==========
-void reportStats() {
+// ========== SYSTEM MONITORING ==========
+void systemMonitoring() {
+  // Stats reporting
   if (millis() - lastStatsReport > 60000) {  // Every minute
+    reportStats();
     lastStatsReport = millis();
-
-    unsigned long uptime = (millis() - sessionStart) / 1000;
-    float readsPerHour = (float)totalReads * 3600.0 / uptime;
-    float successRate = totalReads > 0 ? (float)successfulReads * 100.0 / totalReads : 0;
-
-    Serial.println("=== PERFORMANCE STATS ===");
-    Serial.println("Uptime: " + String(uptime) + "s");
-    Serial.println("Total reads: " + String(totalReads));
-    Serial.println("Success: " + String(successfulReads) + " Failed: " + String(failedReads));
-    Serial.println("Reads/hour: " + String(readsPerHour, 1));
-    Serial.println("Success rate: " + String(successRate, 1) + "%");
-    Serial.println("Queue count: " + String(queueCount));
-    Serial.println("Free RAM: " + String(ESP.getFreeHeap()) + " bytes");
-    Serial.println("System ready: " + String(systemReady ? "YES" : "NO"));
-    Serial.println("========================");
   }
+
+  // Heartbeat
+  if (millis() - lastHeartbeat > 30000) {  // Every 30 seconds
+    Serial.println("♥ System heartbeat - " + String(millis() / 1000) + "s uptime");
+    lastHeartbeat = millis();
+  }
+}
+
+void reportStats() {
+  unsigned long uptime = (millis() - sessionStart) / 1000;
+  float readsPerHour = uptime > 0 ? (float)totalReads * 3600.0 / uptime : 0;
+  float successRate = (successfulRequests + failedRequests) > 0 ? (float)successfulRequests * 100.0 / (successfulRequests + failedRequests) : 100;
+
+  Serial.println("\n=== PERFORMANCE STATS ===");
+  Serial.println("Uptime: " + String(uptime) + "s (" + String(uptime / 60) + "m)");
+  Serial.println("WiFi: " + String(wifiConnected ? "Connected" : "Disconnected"));
+  Serial.println("Signal: " + String(WiFi.RSSI()) + " dBm");
+  Serial.println("Total reads: " + String(totalReads));
+  Serial.println("Reads/hour: " + String(readsPerHour, 1));
+  Serial.println("Success rate: " + String(successRate, 1) + "%");
+  Serial.println("Failed requests: " + String(failedRequests));
+  Serial.println("WiFi reconnects: " + String(wifiReconnects));
+  Serial.println("Queue count: " + String(queueCount));
+  Serial.println("Free heap: " + String(ESP.getFreeHeap()) + " bytes");
+  Serial.println("========================\n");
 }
